@@ -12,11 +12,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
+
+from httpx import ConnectError, TimeoutException
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError, PermissionDeniedError, RateLimitError
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -127,13 +131,43 @@ def _merge_continuation(existing: str, continuation: str) -> str:
     return f"{existing}\n{continuation}"
 
 
-class PipelineError(Exception):
-    """携带面向用户可读中文措辞的流水线错误。"""
+def _classify_upstream_error(exc: Exception) -> tuple[str, str, bool]:
+    """把 SDK/HTTP 异常映射为稳定的错误类型、用户文案和重试策略。"""
+    if isinstance(exc, (AuthenticationError, PermissionDeniedError)):
+        return "auth", "模型服务鉴权失败，请联系管理员", False
+    if isinstance(exc, RateLimitError):
+        return "rate_limit", "模型服务请求过于频繁，请稍后重试", True
+    if isinstance(exc, (APITimeoutError, TimeoutException, asyncio.TimeoutError)):
+        return "timeout", "模型服务响应超时，请稍后重试", True
+    if isinstance(exc, (APIConnectionError, ConnectError, ConnectionError)):
+        return "connection", "模型服务连接失败，请稍后重试", True
+    if isinstance(exc, APIStatusError):
+        status = int(getattr(exc, "status_code", 0) or 0)
+        if status in (401, 403):
+            return "auth", "模型服务鉴权失败，请联系管理员", False
+        if status == 429:
+            return "rate_limit", "模型服务请求过于频繁，请稍后重试", True
+        if status >= 500:
+            return "upstream_5xx", "模型服务暂时不可用，请稍后重试", True
+        return "upstream_http", "模型服务请求失败，请稍后重试", False
+    return "unknown", "模型服务暂时不可用，请稍后重试", False
 
-    def __init__(self, message: str, step_seq: int) -> None:
+
+class PipelineError(Exception):
+    """携带用户文案、失败阶段与可观测错误类型的流水线错误。"""
+
+    def __init__(
+        self,
+        message: str,
+        step_seq: int,
+        error_type: str = "unknown",
+        retriable: bool = False,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.step_seq = step_seq
+        self.error_type = error_type
+        self.retriable = retriable
 
 
 class GenerationCancelled(Exception):
@@ -153,9 +187,9 @@ class GenerationPipeline:
     2. :meth:`run` —— 执行三阶段 AI 调用，其间每个阶段用独立短 DB 阶段更新状态。
     """
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(self, db: AsyncSession, ai: AIHubService | None = None) -> None:
         self._db = db
-        self._ai = AIHubService()
+        self._ai = ai or AIHubService()
 
     # ------------------------------------------------------------------ 落库阶段
 
@@ -299,7 +333,13 @@ class GenerationPipeline:
                 "steps": await self.load_steps(project_public_id, version_seq),
             }
         except PipelineError as exc:
-            await self._fail(project_public_id, version_seq, exc.step_seq, exc.message)
+            await self._fail(
+                project_public_id,
+                version_seq,
+                exc.step_seq,
+                exc.message,
+                exc.error_type,
+            )
             return {
                 "status": "failed",
                 "message": exc.message,
@@ -422,7 +462,10 @@ class GenerationPipeline:
                     max_tokens=CODE_MAX_TOKENS,
                     history=[
                         ChatMessage(role="user", content=user),
-                        ChatMessage(role="assistant", content=doc),
+                        ChatMessage(
+                            role="assistant",
+                            content=doc[-prompts.CONTINUE_HISTORY_MAX_CHARS:],
+                        ),
                     ],
                 )
                 cont = extract_html(cont_raw)
@@ -436,7 +479,9 @@ class GenerationPipeline:
                 return inject_csp(doc)
             logger.warning("代码生成第 %s 轮续写后仍不完整", attempt + 1)
         raise PipelineError(
-            "生成的页面内容不完整（可能被截断），请简化需求后重试", 3
+            "生成的页面内容不完整（可能被截断），请简化需求后重试",
+            3,
+            error_type="truncated",
         )
 
     async def _call_step(
@@ -478,12 +523,21 @@ class GenerationPipeline:
             max_tokens=max_tokens,
         )
         last_error: Exception | None = None
-        for attempt in range(2):
+        last_error_info = ("unknown", "模型服务暂时不可用，请稍后重试", False)
+        for attempt in range(3):
             try:
                 response = await self._ai.gentxt(request)
             except Exception as exc:  # noqa: BLE001
-                logger.exception("阶段 %s 模型调用失败: %s", step_seq, exc)
+                error_type, message, retriable = _classify_upstream_error(exc)
+                logger.warning(
+                    "模型调用失败 project=%s seq=%s stage=%s attempt=%s type=%s: %s",
+                    project_public_id[:8], version_seq, step_seq, attempt + 1, error_type, exc,
+                )
                 last_error = exc
+                last_error_info = (error_type, message, retriable)
+                if not retriable or attempt == 2:
+                    break
+                await asyncio.sleep(0.5 * (2 ** attempt))
                 continue
 
             content = (getattr(response, "content", "") or "").strip()
@@ -492,8 +546,11 @@ class GenerationPipeline:
             logger.warning("阶段 %s 第 %s 次调用返回空内容", step_seq, attempt + 1)
 
         if last_error is not None:
-            raise PipelineError("模型服务暂时不可用，请稍后重试", step_seq) from last_error
-        raise PipelineError("模型返回了空内容，请重新提交生成", step_seq)
+            error_type, message, retriable = last_error_info
+            raise PipelineError(message, step_seq, error_type, retriable) from last_error
+        raise PipelineError(
+            "模型返回了空内容，请重新提交生成", step_seq, error_type="empty", retriable=True
+        )
 
     async def _finish_step(
         self,
@@ -545,6 +602,7 @@ class GenerationPipeline:
         version_seq: int,
         step_seq: int,
         message: str,
+        error_type: str = "unknown",
     ) -> None:
         step = await self._get_step(project_public_id, version_seq, step_seq)
         if step:
@@ -556,6 +614,9 @@ class GenerationPipeline:
         if version and version.status in ACTIVE_STATUSES:
             version.status = "failed"
             version.error = message
+            existing = _parse_json_payload(version.summary or "") or {}
+            existing["error_type"] = error_type
+            version.summary = json.dumps(existing, ensure_ascii=False)
         project = await self._get_project(project_public_id)
         if project and project.latest_status in ACTIVE_STATUSES:
             project.latest_status = "failed"

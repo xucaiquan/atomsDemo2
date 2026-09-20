@@ -41,6 +41,7 @@ from models.projects import Projects
 from models.versions import Versions
 from services import prompts
 from services.pipeline import ACTIVE_STATUSES, FALLBACK_TITLE, GenerationPipeline
+from dependencies.owner import OwnerIdentity, get_owner_identity, set_anonymous_cookie
 
 logger = logging.getLogger(__name__)
 
@@ -76,12 +77,10 @@ def error_envelope(code: str, message: str) -> JSONResponse:
 
 class CreateProjectRequest(BaseModel):
     title: Optional[str] = None
-    owner_key: Optional[str] = None
 
 
 class GenerateRequest(BaseModel):
     prompt: str = ""
-    owner_key: Optional[str] = None
 
 
 # ------------------------------------------------------------------ 序列化工具
@@ -144,18 +143,35 @@ def _parse_summary(raw: str | None) -> dict[str, Any] | None:
 # ------------------------------------------------------------------ 查询工具
 
 
-async def _fetch_project(db: AsyncSession, public_id: str) -> Projects | None:
-    result = await db.execute(select(Projects).where(Projects.public_id == public_id))
+async def _fetch_owned_project(
+    db: AsyncSession, public_id: str, owner: str
+) -> Projects | None:
+    result = await db.execute(
+        select(Projects).where(
+            Projects.public_id == public_id,
+            ((Projects.owner_key == owner) | ((Projects.owner_key.is_(None)) & (Projects.is_demo.is_(True)))),
+        )
+    )
     return result.scalars().first()
 
 
-async def _recover_stale_versions(db: AsyncSession, public_id: str | None = None) -> None:
+def _is_read_only_demo(project: Projects) -> bool:
+    return bool(project.is_demo) or project.owner_key is None
+
+
+async def _recover_stale_versions(
+    db: AsyncSession, owner: str, public_id: str | None = None
+) -> None:
     """启动/访问时清理中断的生成。
 
     对应 data-model.md 的恢复语义：服务重启后残留的 ``pending`` / ``running``
     版本置为 ``failed`` 并写入**面向用户的可读原因**，避免永久卡住的加载态。
     """
-    stmt = select(Versions).where(Versions.status.in_(ACTIVE_STATUSES))
+    owned_projects = select(Projects.public_id).where(Projects.owner_key == owner)
+    stmt = select(Versions).where(
+        Versions.status.in_(ACTIVE_STATUSES),
+        Versions.project_public_id.in_(owned_projects),
+    )
     if public_id:
         stmt = stmt.where(Versions.project_public_id == public_id)
     result = await db.execute(stmt)
@@ -166,10 +182,10 @@ async def _recover_stale_versions(db: AsyncSession, public_id: str | None = None
     now = datetime.now(timezone.utc)
     changed = False
     for version in stale:
-        created = version.created_at
-        if created and created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-        if created and now - created < STALE_AFTER:
+        updated = version.updated_at or version.created_at
+        if updated and updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        if updated and now - updated < STALE_AFTER:
             continue
 
         version.status = "failed"
@@ -187,7 +203,7 @@ async def _recover_stale_versions(db: AsyncSession, public_id: str | None = None
                 step.status = "failed"
                 step.output = step.output or "该阶段被中断"
 
-        project = await _fetch_project(db, version.project_public_id)
+        project = await _fetch_owned_project(db, version.project_public_id, owner)
         if project and project.latest_status in ACTIVE_STATUSES:
             project.latest_status = "failed"
 
@@ -221,42 +237,61 @@ async def health(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/projects")
-async def list_projects(db: AsyncSession = Depends(get_db)):
-    """项目列表，按 updated_at 倒序，不含 html。"""
-    await _recover_stale_versions(db)
-    result = await db.execute(select(Projects).order_by(Projects.updated_at.desc()))
+async def list_projects(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    identity: OwnerIdentity = Depends(get_owner_identity),
+):
+    """返回当前身份项目与全局只读演示项目。"""
+    await _recover_stale_versions(db, identity.key)
+    result = await db.execute(
+        select(Projects)
+        .where(
+            (Projects.owner_key == identity.key)
+            | ((Projects.owner_key.is_(None)) & (Projects.is_demo.is_(True)))
+        )
+        .order_by(Projects.updated_at.desc())
+    )
     projects = list(result.scalars().all())
-    payload = {"projects": [_project_brief(item) for item in projects]}
+    response = JSONResponse(content={"projects": [_project_brief(item) for item in projects]})
+    set_anonymous_cookie(response, identity, request)
     await db.commit()
-    return payload
+    return response
 
 
 @router.post("/projects")
 async def create_project(
     data: CreateProjectRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
+    identity: OwnerIdentity = Depends(get_owner_identity),
 ):
     """创建空项目。title 省略时使用占位名，首次生成完成后由阶段 1 产出覆盖。"""
     title = (data.title or "").strip()[:120] or FALLBACK_TITLE
     project = Projects(
         public_id=str(uuid.uuid4()),
         title=title,
-        owner_key=(data.owner_key or "")[:64] or None,
+        owner_key=identity.key,
         version_count=0,
         latest_status=None,
         is_demo=False,
     )
     db.add(project)
     await db.commit()
-    payload = _project_brief(project)
-    return JSONResponse(status_code=201, content=payload)
+    response = JSONResponse(status_code=201, content=_project_brief(project))
+    set_anonymous_cookie(response, identity, request)
+    return response
 
 
 @router.get("/projects/{public_id}")
-async def get_project(public_id: str, db: AsyncSession = Depends(get_db)):
+async def get_project(
+    public_id: str,
+    db: AsyncSession = Depends(get_db),
+    identity: OwnerIdentity = Depends(get_owner_identity),
+):
     """项目详情：含版本列表（带步骤）与对话记录，不含 html。"""
-    await _recover_stale_versions(db, public_id)
-    project = await _fetch_project(db, public_id)
+    await _recover_stale_versions(db, identity.key, public_id)
+    project = await _fetch_owned_project(db, public_id, identity.key)
     if not project:
         return error_envelope("NOT_FOUND", "项目不存在或已被删除")
 
@@ -308,8 +343,16 @@ async def get_project(public_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/projects/{public_id}/versions/{seq}")
-async def get_version(public_id: str, seq: int, db: AsyncSession = Depends(get_db)):
+async def get_version(
+    public_id: str,
+    seq: int,
+    db: AsyncSession = Depends(get_db),
+    identity: OwnerIdentity = Depends(get_owner_identity),
+):
     """单个版本的完整内容，**仅此接口返回 html**。"""
+    project = await _fetch_owned_project(db, public_id, identity.key)
+    if not project:
+        return error_envelope("NOT_FOUND", "该版本不存在")
     result = await db.execute(
         select(Versions).where(
             Versions.project_public_id == public_id, Versions.seq == seq
@@ -333,12 +376,94 @@ async def get_version(public_id: str, seq: int, db: AsyncSession = Depends(get_d
     return payload
 
 
+@router.post("/projects/{public_id}/versions/{seq}/restore")
+async def restore_version(
+    public_id: str,
+    seq: int,
+    db: AsyncSession = Depends(get_db),
+    identity: OwnerIdentity = Depends(get_owner_identity),
+):
+    """把历史成功版本复制成新的成功版本，保留完整历史。"""
+    project = await _fetch_owned_project(db, public_id, identity.key)
+    if not project:
+        return error_envelope("NOT_FOUND", "该版本不存在")
+    if _is_read_only_demo(project):
+        return error_envelope("CONFLICT", "演示项目为只读，不能恢复版本")
+
+    active_result = await db.execute(
+        select(Versions).where(
+            Versions.project_public_id == public_id,
+            Versions.status.in_(ACTIVE_STATUSES),
+        )
+    )
+    if active_result.scalars().first():
+        return error_envelope("CONFLICT", "项目正在生成，请完成或停止后再恢复")
+
+    source_result = await db.execute(
+        select(Versions).where(
+            Versions.project_public_id == public_id,
+            Versions.seq == seq,
+            Versions.status == "succeeded",
+        )
+    )
+    source = source_result.scalars().first()
+    if not source or not source.html:
+        return error_envelope("NOT_FOUND", "可恢复的成功版本不存在")
+
+    latest_result = await db.execute(
+        select(Versions.seq)
+        .where(Versions.project_public_id == public_id)
+        .order_by(Versions.seq.desc())
+        .limit(1)
+    )
+    new_seq = (latest_result.scalar_one_or_none() or 0) + 1
+    restored = Versions(
+        project_public_id=public_id,
+        seq=new_seq,
+        prompt=f"恢复自 v{seq}",
+        html=source.html,
+        summary=source.summary,
+        status="succeeded",
+        error=None,
+        duration_ms=0,
+    )
+    db.add(restored)
+    db.add(
+        Messages(
+            project_public_id=public_id,
+            role="assistant",
+            content=f"已将 v{seq} 恢复为新的 v{new_seq}，原版本历史保持不变。",
+            version_seq=new_seq,
+        )
+    )
+    project.version_count = new_seq
+    project.latest_status = "succeeded"
+    await db.commit()
+    await db.refresh(restored)
+    return {
+        "seq": restored.seq,
+        "prompt": restored.prompt,
+        "html": restored.html or "",
+        "summary": _parse_summary(restored.summary),
+        "status": restored.status,
+        "error": restored.error,
+        "duration_ms": restored.duration_ms,
+        "created_at": _iso(restored.created_at),
+    }
+
+
 @router.delete("/projects/{public_id}")
-async def delete_project(public_id: str, db: AsyncSession = Depends(get_db)):
-    """删除项目及其下全部版本、消息与步骤（级联）。"""
-    project = await _fetch_project(db, public_id)
+async def delete_project(
+    public_id: str,
+    db: AsyncSession = Depends(get_db),
+    identity: OwnerIdentity = Depends(get_owner_identity),
+):
+    """删除当前身份项目及其下全部版本、消息与步骤。"""
+    project = await _fetch_owned_project(db, public_id, identity.key)
     if not project:
         return error_envelope("NOT_FOUND", "项目不存在或已被删除")
+    if _is_read_only_demo(project):
+        return error_envelope("CONFLICT", "演示项目为只读，不能删除")
 
     for model in (Generation_steps, Messages, Versions):
         rows = await db.execute(
@@ -463,6 +588,7 @@ async def generate(
     data: GenerateRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
+    identity: OwnerIdentity = Depends(get_owner_identity),
 ):
     """受理三阶段生成（异步）。
 
@@ -478,10 +604,12 @@ async def generate(
             "VALIDATION_ERROR", f"描述过长，请精简到 {PROMPT_MAX_LEN} 字以内"
         )
 
-    await _recover_stale_versions(db, public_id)
-    project = await _fetch_project(db, public_id)
+    await _recover_stale_versions(db, identity.key, public_id)
+    project = await _fetch_owned_project(db, public_id, identity.key)
     if not project:
         return error_envelope("NOT_FOUND", "项目不存在或已被删除")
+    if _is_read_only_demo(project):
+        return error_envelope("CONFLICT", "演示项目为只读，请先创建自己的项目")
 
     # 并发约束（FR-012）
     active = await db.execute(
@@ -512,7 +640,10 @@ async def generate(
     # 上下文不会随轮次线性膨胀。必须在 prepare 落库新版本之前查询。
     history_result = await db.execute(
         select(Versions.prompt)
-        .where(Versions.project_public_id == public_id)
+        .where(
+            Versions.project_public_id == public_id,
+            Versions.status == "succeeded",
+        )
         .order_by(Versions.seq)
     )
     history_prompts = [row for row in history_result.scalars().all() if row]
@@ -537,9 +668,15 @@ async def generate(
 
 @router.get("/projects/{public_id}/versions/{seq}/steps")
 async def get_version_steps(
-    public_id: str, seq: int, db: AsyncSession = Depends(get_db)
+    public_id: str,
+    seq: int,
+    db: AsyncSession = Depends(get_db),
+    identity: OwnerIdentity = Depends(get_owner_identity),
 ):
     """轮询用：返回某版本的实时步骤状态与版本状态。"""
+    project = await _fetch_owned_project(db, public_id, identity.key)
+    if not project:
+        return error_envelope("NOT_FOUND", "该版本不存在")
     version_result = await db.execute(
         select(Versions).where(
             Versions.project_public_id == public_id, Versions.seq == seq
@@ -580,7 +717,10 @@ async def get_version_steps(
 
 @router.post("/projects/{public_id}/versions/{seq}/cancel")
 async def cancel_generation(
-    public_id: str, seq: int, db: AsyncSession = Depends(get_db)
+    public_id: str,
+    seq: int,
+    db: AsyncSession = Depends(get_db),
+    identity: OwnerIdentity = Depends(get_owner_identity),
 ):
     """取消进行中的生成（中断任务能力）。
 
@@ -591,9 +731,15 @@ async def cancel_generation(
     - 版本已是终态：返回 409，避免误取消已完成的结果。
     - 已成功的旧版本不受影响；用户输入的需求已持久化，可继续提交新要求。
     """
+    project = await _fetch_owned_project(db, public_id, identity.key)
+    if not project:
+        return error_envelope("NOT_FOUND", "该版本不存在")
+    if _is_read_only_demo(project):
+        return error_envelope("CONFLICT", "演示项目为只读，不能取消生成")
     version_result = await db.execute(
         select(Versions).where(
-            Versions.project_public_id == public_id, Versions.seq == seq
+            Versions.project_public_id == public_id,
+            Versions.seq == seq,
         )
     )
     version = version_result.scalars().first()
@@ -618,8 +764,7 @@ async def cancel_generation(
             step.output = step.output or "已取消"
             step.ended_at = step.ended_at or now_iso
 
-    project = await _fetch_project(db, public_id)
-    if project and project.latest_status in ACTIVE_STATUSES:
+    if project.latest_status in ACTIVE_STATUSES:
         project.latest_status = "cancelled"
 
     db.add(

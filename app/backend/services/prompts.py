@@ -26,7 +26,19 @@ ANALYZE_SYSTEM = """你是一名资深产品经理，负责把用户的一句话
 
 # 需求历史回看的最大条数与单条截断长度，避免上下文线性膨胀（research.md R5）。
 HISTORY_MAX_ITEMS = 6
-HISTORY_ITEM_CHARS = 200
+HISTORY_ITEM_CHARS = 400
+HISTORY_LATEST_CHARS = 600
+PREVIOUS_HTML_MAX_CHARS = 24_000
+CONTINUE_HISTORY_MAX_CHARS = 12_000
+
+
+def truncate_previous_html(html: str | None) -> str:
+    """限制上一版源码上下文，保留文档头、主要前段与闭合附近尾部。"""
+    if not html or len(html) <= PREVIOUS_HTML_MAX_CHARS:
+        return html or ""
+    tail_chars = 2000
+    head_chars = PREVIOUS_HTML_MAX_CHARS - tail_chars
+    return html[:head_chars] + "\n<!-- 上一版源码超出上下文预算，已省略中段 -->\n" + html[-tail_chars:]
 
 
 def build_history_block(history_prompts: list[str] | None) -> str:
@@ -38,9 +50,10 @@ def build_history_block(history_prompts: list[str] | None) -> str:
     cleaned = [p.strip() for p in (history_prompts or []) if p and p.strip()]
     if not cleaned:
         return ""
+    selected = cleaned[-HISTORY_MAX_ITEMS:]
     lines = [
-        f"{i}. {item[:HISTORY_ITEM_CHARS]}"
-        for i, item in enumerate(cleaned[-HISTORY_MAX_ITEMS:], start=1)
+        f"{i}. {item[:(HISTORY_LATEST_CHARS if len(selected) > 1 and i == len(selected) else HISTORY_ITEM_CHARS)]}"
+        for i, item in enumerate(selected, start=1)
     ]
     return (
         "【本项目此前的需求历史（按时间先后，越靠后越新）】\n"
@@ -164,8 +177,9 @@ def build_code_user(
     ]
     if previous_html:
         parts.append(
-            "以下是**上一版页面的完整源码**。请在它的基础上改进，"
-            "保留已有功能不要推倒重来，然后叠加本次的新要求：\n\n" + previous_html
+            "以下是**上一版页面的源码（已按安全上下文预算裁剪）**。请在它的基础上改进，"
+            "保留已有功能不要推倒重来，然后叠加本次的新要求：\n\n"
+            + truncate_previous_html(previous_html)
         )
     parts.append("现在请输出完整的 HTML 源码。")
     return "\n\n".join(parts)

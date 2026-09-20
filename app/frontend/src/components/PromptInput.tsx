@@ -17,6 +17,7 @@ interface PromptInputProps {
   onStop?: () => void;
   isGenerating: boolean;
   hasProject: boolean;
+  readOnly?: boolean;
 }
 
 const EXAMPLES = [
@@ -32,9 +33,10 @@ export default function PromptInput({
   onStop,
   isGenerating,
   hasProject,
+  readOnly = false,
 }: PromptInputProps) {
   const trimmed = value.trim();
-  const canSubmit = trimmed.length > 0 && !isGenerating;
+  const canSubmit = trimmed.length > 0 && !isGenerating && !readOnly;
 
   return (
     <div className="space-y-2.5">
@@ -42,8 +44,11 @@ export default function PromptInput({
         <Textarea
           value={value}
           onChange={(e) => onChange(e.target.value)}
+          disabled={readOnly}
           placeholder={
-            hasProject
+            readOnly
+              ? '演示项目仅供查看，请点击“新项目”开始创作'
+              : hasProject
               ? '在已有应用上继续提要求，例如「再加一个按月份筛选的图表」'
               : '描述你想要的应用，例如「做一个记账小工具，能记收入和支出，显示总余额」'
           }
@@ -75,6 +80,9 @@ export default function PromptInput({
         </div>
       )}
 
+      {readOnly && (
+        <p className="text-[11px] text-violet-300">演示项目为只读；你可以切换版本查看，或新建自己的项目。</p>
+      )}
       <div className="flex gap-2">
         <Button
           onClick={onSubmit}

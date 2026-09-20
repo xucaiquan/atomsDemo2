@@ -85,7 +85,21 @@ def is_complete_document(html: str | None) -> bool:
     """
     if not html:
         return False
-    return html.rstrip().lower().endswith("</html>")
+    text = html.strip()
+    lowered = text.lower()
+    if not lowered.endswith("</html>"):
+        return False
+    if len(re.findall(r"<!doctype\s+html", text, re.IGNORECASE)) > 1:
+        return False
+    if len(re.findall(r"<html[\s>]", text, re.IGNORECASE)) != 1:
+        return False
+    if len(re.findall(r"</html\s*>", text, re.IGNORECASE)) != 1:
+        return False
+    if len(re.findall(r"<body[\s>]", text, re.IGNORECASE)) != 1:
+        return False
+    if len(re.findall(r"</body\s*>", text, re.IGNORECASE)) != 1:
+        return False
+    return lowered.find("<body") < lowered.rfind("</body>") < lowered.rfind("</html>")
 
 
 def inject_csp(html: str | None) -> str:

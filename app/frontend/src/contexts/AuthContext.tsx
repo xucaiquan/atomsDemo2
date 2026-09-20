@@ -1,94 +1,87 @@
-import React, {
+import {
   createContext,
+  useCallback,
   useContext,
-  useState,
   useEffect,
-  ReactNode,
+  useMemo,
+  useState,
+  type ReactNode,
 } from 'react';
-import { authApi } from '../lib/auth';
+import { client } from '@/lib/atoms';
 
-interface User {
+export interface AuthUser {
   id: string;
-  email: string;
+  email?: string;
   name?: string;
-  role: string;
-  last_login?: string;
+  role?: string;
 }
 
-interface AuthContextType {
-  user: User | null;
+type AuthStatus = 'loading' | 'authenticated' | 'anonymous';
+
+interface AuthContextValue {
+  user: AuthUser | null;
+  status: AuthStatus;
   loading: boolean;
-  error: string | null;
-  login: () => Promise<void>;
+  isAdmin: boolean;
+  login: () => void;
   logout: () => Promise<void>;
   refetch: () => Promise<void>;
-  isAdmin: boolean;
 }
 
-const AuthContext = createContext<AuthContextType | null>(null);
+const AuthContext = createContext<AuthContextValue | null>(null);
 
-export const useAuth = () => {
-  const context = useContext(AuthContext);
-  if (!context) {
-    throw new Error('useAuth must be used within an AuthProvider');
-  }
-  return context;
-};
-
-interface AuthProviderProps {
-  children: ReactNode;
+export function useAuth(): AuthContextValue {
+  const value = useContext(AuthContext);
+  if (!value) throw new Error('useAuth 必须在 AuthProvider 内使用');
+  return value;
 }
 
-export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
-  const [user, setUser] = useState<User | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [status, setStatus] = useState<AuthStatus>('loading');
 
-  const checkAuthStatus = async () => {
+  const refetch = useCallback(async () => {
+    setStatus('loading');
     try {
-      setLoading(true);
-      setError(null);
-      const userData = await authApi.getCurrentUser();
-      setUser(userData);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
+      const response = await client.auth.me();
+      const payload = response.data?.data ?? response.data;
+      const nextUser = payload?.user ?? payload;
+      if (nextUser?.id) {
+        setUser(nextUser);
+        setStatus('authenticated');
+      } else {
+        setUser(null);
+        setStatus('anonymous');
+      }
+    } catch {
       setUser(null);
-    } finally {
-      setLoading(false);
+      setStatus('anonymous');
     }
-  };
-
-  const login = async () => {
-    try {
-      setError(null);
-      await authApi.login();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Login failed');
-    }
-  };
-
-  const logout = async () => {
-    try {
-      setError(null);
-      await authApi.logout();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Logout failed');
-    }
-  };
-
-  useEffect(() => {
-    checkAuthStatus();
   }, []);
 
-  const value: AuthContextType = {
-    user,
-    loading,
-    error,
-    login,
-    logout,
-    refetch: checkAuthStatus,
-    isAdmin: user?.role === 'admin',
-  };
+  useEffect(() => {
+    void refetch();
+  }, [refetch]);
+
+  const login = useCallback(() => client.auth.toLogin(), []);
+  const logout = useCallback(async () => {
+    await client.auth.logout();
+    setUser(null);
+    setStatus('anonymous');
+  }, []);
+
+  const value = useMemo<AuthContextValue>(
+    () => ({
+      user,
+      status,
+      loading: status === 'loading',
+      isAdmin: user?.role === 'admin',
+      login,
+      logout,
+      refetch,
+    }),
+    [login, logout, refetch, status, user],
+  );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
-};
+}

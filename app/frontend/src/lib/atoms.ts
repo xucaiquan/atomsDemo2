@@ -7,7 +7,7 @@
  */
 import { createClient } from '@metagptx/web-sdk';
 
-const client = createClient();
+export const client = createClient();
 
 /** 生成步骤的五态（cancelled：用户主动停止生成）。 */
 export type StepStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
@@ -188,6 +188,14 @@ export const atomsApi = {
     return invoke<StepsSnapshot>(
       `/api/v1/atoms/projects/${publicId}/versions/${seq}/steps`,
       'GET',
+    );
+  },
+
+  /** 将历史成功版本复制为新的最新版本，原历史保持不变。 */
+  restoreVersion(publicId: string, seq: number): Promise<VersionDetail> {
+    return invoke<VersionDetail>(
+      `/api/v1/atoms/projects/${publicId}/versions/${seq}/restore`,
+      'POST',
     );
   },
 

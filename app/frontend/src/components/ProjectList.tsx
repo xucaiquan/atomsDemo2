@@ -88,17 +88,23 @@ export default function ProjectList({
               <span className="min-w-0 flex-1 truncate text-sm text-slate-200">
                 {project.title}
               </span>
-              <button
-                type="button"
-                aria-label="删除项目"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onDelete(project.public_id);
-                }}
-                className="hidden shrink-0 rounded p-0.5 text-slate-500 hover:text-rose-400 group-hover:block"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-              </button>
+              {project.is_demo ? (
+                <span className="shrink-0 rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-300">
+                  演示
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  aria-label="删除项目"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete(project.public_id);
+                  }}
+                  className="hidden shrink-0 rounded p-0.5 text-slate-500 hover:text-rose-400 group-hover:block"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              )}
             </div>
             <div className="mt-1 flex items-center gap-2 pl-5.5 text-[11px] text-slate-500">
               {project.latest_status && (

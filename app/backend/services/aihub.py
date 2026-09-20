@@ -92,6 +92,8 @@ class AIHubService:
             self.client = AsyncOpenAI(
                 api_key=settings.app_ai_key,
                 base_url=settings.app_ai_base_url.rstrip("/"),
+                timeout=180.0,
+                max_retries=1,
             )
 
     def _require_ai_client(self) -> "AsyncOpenAI":

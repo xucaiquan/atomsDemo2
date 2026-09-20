@@ -14,6 +14,8 @@ import {
   Code2,
   History,
   Loader2,
+  LogIn,
+  LogOut,
   MessageSquare,
   MonitorPlay,
   Plus,
@@ -21,6 +23,7 @@ import {
   Wand2,
 } from 'lucide-react';
 
+import { useAuth } from '@/contexts/AuthContext';
 import AgentSteps from '@/components/AgentSteps';
 import CodeViewer from '@/components/CodeViewer';
 import ConversationPanel from '@/components/ConversationPanel';
@@ -49,12 +52,15 @@ const POLL_INTERVAL_MS = 2500;
 const GENERATION_POLL_TIMEOUT_MS = 12 * 60 * 1000;
 
 export default function Index() {
+  const { user, status: authStatus, login, logout } = useAuth();
   // ---------------- 项目与详情 ----------------
   const [projects, setProjects] = useState<ProjectBrief[]>([]);
   const [projectsLoading, setProjectsLoading] = useState(true);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [versionLoading, setVersionLoading] = useState(false);
+  const [restoring, setRestoring] = useState(false);
 
   // ---------------- 生成状态 ----------------
   const [prompt, setPrompt] = useState('');
@@ -119,6 +125,8 @@ export default function Index() {
       if (!activeId) return;
       setActiveSeq(seq);
       setView('preview');
+      setHtml('');
+      setVersionLoading(true);
       try {
         const full = await atomsApi.getVersion(activeId, seq);
         setHtml(full.html || '');
@@ -127,7 +135,10 @@ export default function Index() {
         const version = detail?.versions.find((v) => v.seq === seq);
         if (version) setSteps(version.steps);
       } catch (e) {
+        setFailedMessage((e as Error).message || '版本内容加载失败');
         toast.error((e as Error).message || '版本内容加载失败');
+      } finally {
+        setVersionLoading(false);
       }
     },
     [activeId, detail],
@@ -325,6 +336,41 @@ export default function Index() {
     setView('preview');
   }, []);
 
+  // ---------------- 版本恢复：复制为新的最新成功版本 ----------------
+  const handleRestore = useCallback(async (seq: number) => {
+    if (!activeId || restoring) return;
+    setRestoring(true);
+    try {
+      const restored = await atomsApi.restoreVersion(activeId, seq);
+      setHtml(restored.html || '');
+      setActiveSeq(restored.seq);
+      setFailedMessage(null);
+      const data = await atomsApi.getProject(activeId);
+      setDetail(data);
+      await refreshProjects();
+      toast.success(`已将 v${seq} 恢复为新的 v${restored.seq}`);
+    } catch (e) {
+      toast.error((e as Error).message || '版本恢复失败');
+    } finally {
+      setRestoring(false);
+    }
+  }, [activeId, refreshProjects, restoring]);
+
+  const handleLogout = useCallback(async () => {
+    try {
+      await logout();
+      stopPolling();
+      generatingSeqRef.current = null;
+      setProjects([]);
+      setProjectsLoading(true);
+      handleNewProject();
+      await refreshProjects();
+      toast.success('已退出登录，当前为匿名空间');
+    } catch (e) {
+      toast.error((e as Error).message || '退出登录失败');
+    }
+  }, [handleNewProject, logout, refreshProjects, stopPolling]);
+
   // ---------------- 删除项目 ----------------
   const handleDelete = useCallback(
     async (publicId: string) => {
@@ -361,6 +407,30 @@ export default function Index() {
               <Loader2 className="h-3 w-3 animate-spin" />
               智能体工作中
             </span>
+          )}
+          {authStatus === 'loading' ? (
+            <span className="text-xs text-slate-500">正在确认身份…</span>
+          ) : authStatus === 'authenticated' ? (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void handleLogout()}
+              className="gap-1.5 rounded-xl border-slate-700 bg-transparent text-slate-300 hover:bg-slate-800 hover:text-white"
+              title={user?.email || user?.name || '已登录'}
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              退出
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={login}
+              className="gap-1.5 rounded-xl border-slate-700 bg-transparent text-slate-300 hover:bg-slate-800 hover:text-white"
+            >
+              <LogIn className="h-3.5 w-3.5" />
+              登录（可选）
+            </Button>
           )}
           <Button
             size="sm"
@@ -449,6 +519,7 @@ export default function Index() {
               onStop={() => void handleStop()}
               isGenerating={isGenerating}
               hasProject={!!activeId && hasExistingApp}
+              readOnly={Boolean(detail?.is_demo)}
             />
           </div>
         </section>
@@ -486,7 +557,10 @@ export default function Index() {
               <VersionSwitcher
                 versions={versions}
                 activeSeq={activeSeq}
+                readOnly={Boolean(detail?.is_demo)}
+                restoring={restoring}
                 onSelect={(seq) => void switchVersion(seq)}
+                onRestore={(seq) => void handleRestore(seq)}
               />
             </div>
             {detail && (
@@ -495,10 +569,10 @@ export default function Index() {
           </div>
 
           <div className="min-h-0 flex-1">
-            {detailLoading ? (
+            {detailLoading || versionLoading ? (
               <div className="flex h-full items-center justify-center gap-2 text-sm text-slate-500">
                 <Loader2 className="h-4 w-4 animate-spin" />
-                加载项目内容…
+                {versionLoading ? '加载版本内容…' : '加载项目内容…'}
               </div>
             ) : view === 'preview' ? (
               <PreviewPane
